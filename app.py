@@ -1,11 +1,12 @@
 # app.py
-# FastAPI API for PO parser: sync (/runs) and async (/runs_async + /runs/{id}) with file-backed job status.
+# FastAPI API for PO parser: sync (/runs) and async (/runs_async + /runs/{id})
+# with file-backed job status and downloadable agent logs.
 from fastapi import FastAPI, Request, Query
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
 from typing import List, Optional, Dict, Any
-import os, uuid, shutil, subprocess, logging, pathlib, threading, queue, json
+import os, uuid, shutil, subprocess, logging, pathlib, threading, queue, json, textwrap
 import requests
 
 # ---------- Config ----------
@@ -13,7 +14,7 @@ WORKDIR_BASE = os.getenv("WORKDIR_BASE", "/tmp")   # Render has write access her
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 
 # ---------- App ----------
-app = FastAPI(title="PO Agent API", version="1.3.0")
+app = FastAPI(title="PO Agent API", version="1.3.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -65,10 +66,16 @@ def build_download_url(request: Request, local_path: str) -> str:
     return str(request.url_for("download") + f"?path={local_path}")
 
 def run_agent_sync(run_id: str, input_urls: List[str]) -> Dict[str, Any]:
-    """Download inputs, run agent synchronously, and return outputs dict."""
+    """
+    Download inputs, run agent synchronously, and return outputs dict.
+    Raises on failure (with stderr tail in message) but also writes stdout/stderr to files.
+    """
     workdir = make_workdir(run_id)
+
     if not input_urls:
         raise ValueError("input_urls must be non-empty")
+
+    # Download inputs
     for url in input_urls:
         if "dropbox.com" in url and not _is_dropbox_direct(str(url)):
             log.warning(f"URL missing dl=1: {url}")
@@ -76,6 +83,8 @@ def run_agent_sync(run_id: str, input_urls: List[str]) -> Dict[str, Any]:
         dest = os.path.join(workdir, "input", filename)
         log.info(f"[DOWNLOAD] {url} -> {dest}")
         download_to(dest, str(url))
+
+    # Execute agent
     cmd = [
         "python", "run_agent.py",
         "--run-id", run_id,
@@ -85,31 +94,36 @@ def run_agent_sync(run_id: str, input_urls: List[str]) -> Dict[str, Any]:
         "--logs", os.path.join(workdir, "logs"),
     ]
     log.info(f"[EXEC] {' '.join(cmd)}")
-    import textwrap
 
-res = subprocess.run(
-    cmd,
-    cwd=".",
-    text=True,
-    capture_output=True,
-)
+    res = subprocess.run(
+        cmd,
+        cwd=".",
+        text=True,
+        capture_output=True,
+    )
 
-# write logs so we can download them
-stdout_path = os.path.join(workdir, "logs", "agent.stdout.txt")
-stderr_path = os.path.join(workdir, "logs", "agent.stderr.txt")
-os.makedirs(os.path.dirname(stdout_path), exist_ok=True)
-with open(stdout_path, "w") as f:
-    f.write(res.stdout or "")
-with open(stderr_path, "w") as f:
-    f.write(res.stderr or "")
+    # Persist agent logs
+    stdout_path = os.path.join(workdir, "logs", "agent.stdout.txt")
+    stderr_path = os.path.join(workdir, "logs", "agent.stderr.txt")
+    os.makedirs(os.path.dirname(stdout_path), exist_ok=True)
+    with open(stdout_path, "w") as f:
+        f.write(res.stdout or "")
+    with open(stderr_path, "w") as f:
+        f.write(res.stderr or "")
 
-if res.returncode != 0:
-    # include tail of stderr in the error for quick viewing
-    tail = (res.stderr or "")[-800:]
-    raise RuntimeError(f"agent exited {res.returncode}. stderr tail:\\n{textwrap.dedent(tail)}")
+    if res.returncode != 0:
+        tail = (res.stderr or "")[-1200:]
+        raise RuntimeError(f"agent exited {res.returncode}. stderr tail:\n{textwrap.dedent(tail)}")
+
+    # Outputs expected from agent
     combined_csv = os.path.join(workdir, "output", f"combined_{run_id}.csv")
     changelog = os.path.join(workdir, "CHANGELOG.md")
-    return {"combined_csv": combined_csv, "changelog": changelog, "stdout": stdout_path, "stderr": stderr_path}
+    return {
+        "combined_csv": combined_csv,
+        "changelog": changelog,
+        "stdout": stdout_path,
+        "stderr": stderr_path,
+    }
 
 # ---------- File-backed job store ----------
 JOBS_DIR = os.path.join(WORKDIR_BASE, "jobs")
@@ -147,59 +161,22 @@ def _worker_loop():
             # running
             st = JobStatus(**{**st.dict(), "status": "running"})
             _jobs[job_id] = st; _save_job(st.dict())
-            outputs = run_agent_sync(job["run_id"], job["input_urls'])
+
+            outputs = run_agent_sync(job["run_id"], job["input_urls"])
+
             # succeeded
             st = JobStatus(job_id=job_id, run_id=job["run_id"], status="succeeded", outputs=outputs)
             _jobs[job_id] = st; _save_job(st.dict())
-        except subprocess.CalledProcessError as e:
-            st = JobStatus(job_id=job_id, run_id=job["run_id"], status="failed", error=str(e))
-            _jobs[job_id] = st; _save_job(st.dict())
         except Exception as e:
-            st = JobStatus(job_id=job_id, run_id=job["run_id"], status="failed", error=str(e))
+            st = JobStatus(job_id=job_id, run_id=job["run_id"], status="failed", error=str(e),
+                           outputs=st.outputs if 'st' in locals() and st.outputs else None)
             _jobs[job_id] = st; _save_job(st.dict())
         finally:
             _q.task_done()
 
 threading.Thread(target=_worker_loop, daemon=True).start()
 
-# ---------- Routes ----------
-@app.get("/")
-def health() -> dict:
-    return {"status": "ok", "service": "po-agent", "docs": "/docs"}
-
-@app.post("/runs")
-def start_run(body: RunBody, request: Request):
-    """SYNC: runs the agent inline (may hit Render free request timeout)."""
-    run_id = body.run_id or f"RUN-{uuid.uuid4().hex[:10]}"
-    try:
-        outputs = run_agent_sync(run_id, [str(u) for u in body.input_urls])
-    except subprocess.CalledProcessError as e:
-        log.exception("Agent run failed")
-        return JSONResponse(status_code=500, content={"error": "Agent failed", "detail": str(e), "run_id": run_id})
-    except Exception as e:
-        log.exception("Run failed")
-        return JSONResponse(status_code=502, content={"error": "Run failed", "detail": str(e), "run_id": run_id})
-    return {
-        "run_id": run_id,
-        "outputs": {
-            "combined_csv": outputs["combined_csv"],
-            "combined_csv_url": build_download_url(request, outputs["combined_csv"]),
-            "changelog": outputs["changelog"],
-            "changelog_url": build_download_url(request, outputs["changelog"]),
-        }
-    }
-
-@app.post("/runs_async")
-def start_run_async(body: RunBody):
-    """ASYNC: enqueue a job and return job_id immediately; poll GET /runs/{job_id}."""
-    run_id = body.run_id or f"RUN-{uuid.uuid4().hex[:10]}"
-    job_id = f"job-{uuid.uuid4().hex[:10]}"
-    st = JobStatus(job_id=job_id, run_id=run_id, status="queued")
-    _jobs[job_id] = st; _save_job(st.dict())
-    _q.put({"job_id": job_id, "run_id": run_id, "input_urls": [str(u) for u in body.input_urls]})
-    return {"job_id": job_id, "run_id": run_id, "status": "queued"}
-
-@app.get("/runs/{job_id}")
+# ---------- URL attachment helper (PUT THIS BEFORE get_run_status) ----------
 def _attach_urls(request: Request, outputs: dict) -> dict:
     if not outputs:
         return {}
@@ -213,6 +190,50 @@ def _attach_urls(request: Request, outputs: dict) -> dict:
     if outputs.get("stderr"):
         out["stderr_url"] = build_download_url(request, outputs["stderr"])
     return out
+
+# ---------- Routes ----------
+@app.get("/")
+def health() -> dict:
+    return {"status": "ok", "service": "po-agent", "docs": "/docs"}
+
+@app.post("/runs")
+def start_run(body: RunBody, request: Request):
+    """SYNC: runs the agent inline (may hit Render free request timeout)."""
+    run_id = body.run_id or f"RUN-{uuid.uuid4().hex[:10]}"
+    try:
+        outputs = run_agent_sync(run_id, [str(u) for u in body.input_urls])
+        result_outputs = _attach_urls(request, outputs)
+        return {"run_id": run_id, "outputs": result_outputs}
+    except Exception as e:
+        log.exception("Run failed")
+        # Try to include log URLs if we already created a workdir
+        workdir = os.path.join(WORKDIR_BASE, run_id)
+        stdout = os.path.join(workdir, "logs", "agent.stdout.txt")
+        stderr = os.path.join(workdir, "logs", "agent.stderr.txt")
+        outputs = {}
+        if os.path.exists(stdout): outputs["stdout"] = stdout
+        if os.path.exists(stderr): outputs["stderr"] = stderr
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": "Run failed",
+                "detail": str(e),
+                "run_id": run_id,
+                "outputs": _attach_urls(request, outputs) if outputs else None,
+            },
+        )
+
+@app.post("/runs_async")
+def start_run_async(body: RunBody):
+    """ASYNC: enqueue a job and return job_id immediately; poll GET /runs/{job_id}."""
+    run_id = body.run_id or f"RUN-{uuid.uuid4().hex[:10]}"
+    job_id = f"job-{uuid.uuid4().hex[:10]}"
+    st = JobStatus(job_id=job_id, run_id=run_id, status="queued")
+    _jobs[job_id] = st; _save_job(st.dict())
+    _q.put({"job_id": job_id, "run_id": run_id, "input_urls": [str(u) for u in body.input_urls]})
+    return {"job_id": job_id, "run_id": run_id, "status": "queued"}
+
+@app.get("/runs/{job_id}")
 def get_run_status(job_id: str, request: Request):
     st = _jobs.get(job_id)
     if not st:
@@ -223,12 +244,11 @@ def get_run_status(job_id: str, request: Request):
             return JSONResponse(status_code=404, content={"error": "unknown job_id"})
     payload = st.dict()
     if st.outputs:
-    payload["outputs"] = _attach_urls(request, st.outputs)
-        }
+        payload["outputs"] = _attach_urls(request, st.outputs)
     return payload
 
 @app.get("/download", name="download")
-def download(path: str = Query(..., description="Absolute local path returned by /runs or /runs/{id}"))):
+def download(path: str = Query(..., description="Absolute local path returned by /runs or /runs/{id}")):
     try:
         local = safe_local_path(path)
     except ValueError as e:
