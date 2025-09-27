@@ -1,0 +1,11 @@
+{
+  "schema_version": "1.2.2",
+  "required": [
+    "run_id",
+    "po_number"
+  ],
+  "fields": {
+    "run_id": "string",
+    "po_number": "string"
+  }
+}
