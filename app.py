@@ -85,10 +85,31 @@ def run_agent_sync(run_id: str, input_urls: List[str]) -> Dict[str, Any]:
         "--logs", os.path.join(workdir, "logs"),
     ]
     log.info(f"[EXEC] {' '.join(cmd)}")
-    subprocess.check_call(cmd, cwd=".")
+    import textwrap
+
+res = subprocess.run(
+    cmd,
+    cwd=".",
+    text=True,
+    capture_output=True,
+)
+
+# write logs so we can download them
+stdout_path = os.path.join(workdir, "logs", "agent.stdout.txt")
+stderr_path = os.path.join(workdir, "logs", "agent.stderr.txt")
+os.makedirs(os.path.dirname(stdout_path), exist_ok=True)
+with open(stdout_path, "w") as f:
+    f.write(res.stdout or "")
+with open(stderr_path, "w") as f:
+    f.write(res.stderr or "")
+
+if res.returncode != 0:
+    # include tail of stderr in the error for quick viewing
+    tail = (res.stderr or "")[-800:]
+    raise RuntimeError(f"agent exited {res.returncode}. stderr tail:\\n{textwrap.dedent(tail)}")
     combined_csv = os.path.join(workdir, "output", f"combined_{run_id}.csv")
     changelog = os.path.join(workdir, "CHANGELOG.md")
-    return {"combined_csv": combined_csv, "changelog": changelog}
+    return {"combined_csv": combined_csv, "changelog": changelog, "stdout": stdout_path, "stderr": stderr_path}
 
 # ---------- File-backed job store ----------
 JOBS_DIR = os.path.join(WORKDIR_BASE, "jobs")
