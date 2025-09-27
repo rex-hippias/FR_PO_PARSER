@@ -222,13 +222,8 @@ def get_run_status(job_id: str, request: Request):
         else:
             return JSONResponse(status_code=404, content={"error": "unknown job_id"})
     payload = st.dict()
-    if st.status == "succeeded" and st.outputs:
-        combined = st.outputs.get("combined_csv")
-        changelog = st.outputs.get("changelog")
-        payload["outputs"] = {
-            **st.outputs,
-            "combined_csv_url": build_download_url(request, combined) if combined else None,
-            "changelog_url": build_download_url(request, changelog) if changelog else None,
+    if st.outputs:
+    payload["outputs"] = _attach_urls(request, st.outputs)
         }
     return payload
 
