@@ -200,6 +200,19 @@ def start_run_async(body: RunBody):
     return {"job_id": job_id, "run_id": run_id, "status": "queued"}
 
 @app.get("/runs/{job_id}")
+def _attach_urls(request: Request, outputs: dict) -> dict:
+    if not outputs:
+        return {}
+    out = dict(outputs)
+    if outputs.get("combined_csv"):
+        out["combined_csv_url"] = build_download_url(request, outputs["combined_csv"])
+    if outputs.get("changelog"):
+        out["changelog_url"] = build_download_url(request, outputs["changelog"])
+    if outputs.get("stdout"):
+        out["stdout_url"] = build_download_url(request, outputs["stdout"])
+    if outputs.get("stderr"):
+        out["stderr_url"] = build_download_url(request, outputs["stderr"])
+    return out
 def get_run_status(job_id: str, request: Request):
     st = _jobs.get(job_id)
     if not st:
