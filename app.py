@@ -235,17 +235,38 @@ def start_run_async(body: RunBody):
 
 @app.get("/runs/{job_id}")
 def get_run_status(job_id: str, request: Request):
-    st = _jobs.get(job_id)
-    if not st:
+    try:
+        st = _jobs.get(job_id)
+        if not st:
+            data = _load_job(job_id)
+            if data:
+                st = JobStatus(**data)
+            else:
+                return JSONResponse(status_code=404, content={"error": "unknown job_id"})
+
+        payload = st.dict()
+        if st.outputs:
+            # attach downloadable URLs, but don't let failures crash the endpoint
+            try:
+                payload["outputs"] = _attach_urls(request, st.outputs)
+            except Exception as e:
+                payload["outputs"] = st.outputs
+                payload["attach_error"] = str(e)
+        return payload
+
+    except Exception as e:
+        # return structured error instead of raw 500
         data = _load_job(job_id)
-        if data:
-            st = JobStatus(**data)
-        else:
-            return JSONResponse(status_code=404, content={"error": "unknown job_id"})
-    payload = st.dict()
-    if st.outputs:
-        payload["outputs"] = _attach_urls(request, st.outputs)
-    return payload
+        safe_state = data if isinstance(data, dict) else None
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": "internal_error",
+                "detail": str(e),
+                "job_id": job_id,
+                "state": safe_state,
+            },
+        )
 
 @app.get("/download", name="download")
 def download(path: str = Query(..., description="Absolute local path returned by /runs or /runs/{id}")):
