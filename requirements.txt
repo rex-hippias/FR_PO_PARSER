@@ -3,3 +3,5 @@ uvicorn
 requests
 pandas
 pdfplumber
+pydantic
+pypdf
