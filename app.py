@@ -2,6 +2,7 @@
 import os
 import uuid
 import subprocess
+import json, os
 from typing import List, Optional, Dict
 
 import requests
@@ -56,7 +57,31 @@ def download_to(url: str, dest_path: str) -> None:
         raise HTTPException(status_code=400, detail=f"Failed to download {url}: {e}")
     with open(dest_path, "wb") as f:
         f.write(r.content)
+def job_file(run_id: str) -> str:
+    return os.path.join(RUNS_BASE, run_id, "job.json")
 
+def save_job(job: dict) -> None:
+    try:
+        with open(job_file(job["run_id"]), "w") as f:
+            json.dump(job, f)
+    except Exception:
+        pass
+
+def load_job_by_id(job_id: str) -> dict | None:
+    # scan RUNS_BASE for a job.json that matches this job_id
+    if not os.path.isdir(RUNS_BASE):
+        return None
+    for run_id in os.listdir(RUNS_BASE):
+        p = job_file(run_id)
+        try:
+            if os.path.exists(p):
+                with open(p) as f:
+                    j = json.load(f)
+                if j.get("job_id") == job_id:
+                    return j
+        except Exception:
+            continue
+    return None
 
 # ---------- Routes ----------
 @app.get("/health")
