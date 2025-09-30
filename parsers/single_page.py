@@ -25,3 +25,4 @@ def parse_single_page(text: str) -> List[Dict[str, str]]:
                 })
                 break
     return rows
+    

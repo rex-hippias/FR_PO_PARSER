@@ -10,3 +10,4 @@ def write_combined(rows: List[Dict[str,str]], out_path: str) -> None:
         w.writeheader()
         for r in rows:
             w.writerow({k: r.get(k,"") for k in FIELDS})
+            

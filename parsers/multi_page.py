@@ -8,3 +8,4 @@ def parse_multi_page(pages: List[str]) -> List[Dict[str, str]]:
     """
     merged = "\n".join(pages)
     return parse_single_page(merged)
+    
