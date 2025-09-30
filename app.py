@@ -69,11 +69,33 @@ async def start_run(req: RunRequest):
         else:
             jobs[job_id]["status"] = "failed"
         jobs[job_id]["error"] = result.stderr.strip() if result.returncode != 0 else None
-        jobs[job_id]["outputs"] = {
-            "combined_csv": os.path.join(output_dir, f"combined_{req.run_id}.csv"),
-            "stdout_url": f"/download?path={os.path.join(logs_dir,'agent.stdout.txt')}",
-            "stderr_url": f"/download?path={os.path.join(logs_dir,'agent.stderr.txt')}",
-        }
+from urllib.parse import quote
+
+base = os.getenv("PUBLIC_BASE_URL", "https://fr-po-parser.onrender.com").rstrip("/")
+
+def mk_url(abs_path: str) -> str:
+    return f"{base}/download?path={quote(abs_path, safe='')}"
+
+combined_path = os.path.join(output_dir, f"combined_{req.run_id}.csv")
+stdout_path   = os.path.join(logs_dir, "agent.stdout.txt")
+stderr_path   = os.path.join(logs_dir, "agent.stderr.txt")
+
+# Collect debug/*.txt files if they exist
+debug_dir = os.path.join(os.path.dirname(output_dir), "debug")
+debug_urls = []
+if os.path.exists(debug_dir):
+    for fname in os.listdir(debug_dir):
+        if fname.lower().endswith(".txt"):
+            absf = os.path.join(debug_dir, fname)
+            debug_urls.append(mk_url(absf))
+
+jobs[job_id]["outputs"] = {
+    "combined_csv": combined_path,
+    "combined_csv_url": mk_url(combined_path),
+    "stdout_url": mk_url(stdout_path),
+    "stderr_url": mk_url(stderr_path),
+    "debug_urls": debug_urls,
+}
     except Exception as e:
         jobs[job_id]["status"] = "failed"
         jobs[job_id]["error"] = str(e)
