@@ -1,122 +1,137 @@
 # run_agent.py
-import os, re, csv, sys, argparse
+import os
+import re
+import sys
+import argparse
 from typing import List, Dict
-from pypdf import PdfReader  # pip install pypdf
 
-LINE_PATTERNS = [
-    # Common PO row: line  SKU/Item     QTY   PRICE (very generic; adjust to your format)
-    re.compile(r"^\s*(\d{1,4})\s+([A-Z0-9\-_/]+)\s+(\d{1,6})\s+(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)\s*$"),
-    # Variant: line then description then qty price
-    re.compile(r"^\s*(\d{1,4})\s+([^\s].*?)\s+(\d{1,6})\s+(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)\s*$"),
-]
+from pypdf import PdfReader  # pip install pypdf
+from parsers.single_page import parse_single_page
+from parsers.multi_page import parse_multi_page
+from writers.combined_csv import write_combined
+
 
 PO_PATTERNS = [
     re.compile(r"\bPO(?:\s*#|[:\s])\s*([A-Z0-9\-]+)", re.IGNORECASE),
     re.compile(r"\bPurchase\s*Order(?:\s*#|[:\s])\s*([A-Z0-9\-]+)", re.IGNORECASE),
 ]
 
-def read_pdf_text(path: str) -> str:
-    try:
-        reader = PdfReader(path)
-        parts = []
-        for page in reader.pages:
-            parts.append(page.extract_text() or "")
-        return "\n".join(parts)
-    except Exception as e:
-        raise RuntimeError(f"Failed to read {os.path.basename(path)}: {e}")
+def read_pages(path: str) -> List[str]:
+    """Extract text for each page of a PDF (empty string if a page has no text)."""
+    reader = PdfReader(path)
+    pages: List[str] = []
+    for p in reader.pages:
+        try:
+            pages.append(p.extract_text() or "")
+        except Exception:
+            # Some pages (forms) may raise; keep pipeline moving
+            pages.append("")
+    return pages
 
-def guess_po_number(text: str) -> str:
+def guess_po_number(full_text: str, filename: str) -> str:
     for pat in PO_PATTERNS:
-        m = pat.search(text)
+        m = pat.search(full_text)
         if m:
             return m.group(1).strip()
-    return ""  # unknown
+    # fallback: derive from filename
+    base = os.path.splitext(os.path.basename(filename))[0]
+    m = re.search(r"(?:PO|Purchase-Order)[-_ ]?([A-Za-z0-9\-]+)", base, re.IGNORECASE)
+    return (m.group(1) if m else base).strip()
 
-def parse_lines(text: str) -> List[Dict[str, str]]:
-    rows = []
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        for pat in LINE_PATTERNS:
-            m = pat.match(line)
-            if m:
-                rows.append({
-                    "line_number": m.group(1),
-                    "sku": m.group(2),
-                    "qty": m.group(3),
-                    "price": m.group(4),
-                })
-                break
-    return rows
+def ensure_dirs(*paths: str) -> None:
+    for p in paths:
+        os.makedirs(p, exist_ok=True)
 
-def write_csv(rows: List[Dict[str, str]], out_path: str) -> None:
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    fieldnames = ["po_number", "file_name", "line_number", "sku", "qty", "price"]
-    with open(out_path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        for r in rows:
-            w.writerow(r)
-
-def main():
+def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--run-id", required=True)
     ap.add_argument("--input", required=True)
-    ap.add_argument("--parsed", required=True)  # for parity (unused here)
+    ap.add_argument("--parsed", required=True)  # kept for parity (unused in this baseline)
     ap.add_argument("--output", required=True)
     ap.add_argument("--logs", required=True)
     args = ap.parse_args()
 
-    os.makedirs(args.output, exist_ok=True)
-    os.makedirs(args.logs, exist_ok=True)
+    ensure_dirs(args.output, args.logs)
+    debug_dir = os.path.join(os.path.dirname(args.output), "debug")
+    ensure_dirs(debug_dir)
+
     stdout_path = os.path.join(args.logs, "agent.stdout.txt")
     stderr_path = os.path.join(args.logs, "agent.stderr.txt")
 
-    def log_out(msg: str):
-        with open(stdout_path, "a") as f: f.write(msg.rstrip() + "\n")
-    def log_err(msg: str):
-        with open(stderr_path, "a") as f: f.write(msg.rstrip() + "\n")
+    def log_out(msg: str) -> None:
+        with open(stdout_path, "a") as f:
+            f.write(str(msg).rstrip() + "\n")
 
-    combined_rows: List[Dict[str, str]] = []
-    pdfs = [p for p in os.listdir(args.input) if p.lower().endswith(".pdf")]
+    def log_err(msg: str) -> None:
+        with open(stderr_path, "a") as f:
+            f.write(str(msg).rstrip() + "\n")
+
+    try:
+        pdfs = [fn for fn in os.listdir(args.input) if fn.lower().endswith(".pdf")]
+    except Exception as e:
+        log_err(f"Input directory error: {e}")
+        return 2
+
     if not pdfs:
         log_err("No PDFs found in input/")
         return 2
 
-    for fname in pdfs:
+    combined_rows: List[Dict[str, str]] = []
+
+    for fname in sorted(pdfs):
         fpath = os.path.join(args.input, fname)
         try:
-            text = read_pdf_text(fpath)
-            po = guess_po_number(text) or ""
-            rows = parse_lines(text)
+            pages = read_pages(fpath)
+            full_text = "\n".join(pages)
+
+            # Write debug dump for inspection/tuning
+            dbg_path = os.path.join(debug_dir, f"po_text_{fname}.txt")
+            with open(dbg_path, "w") as dbg:
+                dbg.write(full_text)
+
+            po_number = guess_po_number(full_text, fname)
+
+            # Choose strategy
+            if len(pages) <= 1:
+                rows = parse_single_page(full_text)
+            else:
+                rows = parse_multi_page(pages)
+
             if not rows:
-                log_err(f"{fname}: no line items matched baseline patterns")
+                log_err(f"{fname}: no line items matched (see {os.path.basename(dbg_path)})")
+            else:
+                log_out(f"{fname}: parsed {len(rows)} rows (PO={po_number or 'unknown'})")
+
+            # Normalize & enrich
             for r in rows:
-                r_full = {
-                    "po_number": po,
+                combined_rows.append({
+                    "po_number": po_number,
                     "file_name": fname,
-                    "line_number": r.get("line_number",""),
-                    "sku": r.get("sku",""),
-                    "qty": r.get("qty",""),
-                    "price": r.get("price",""),
-                }
-                combined_rows.append(r_full)
-            log_out(f"{fname}: parsed {len(rows)} rows (PO={po or 'unknown'})")
+                    "line_number": str(r.get("line_number", "")),
+                    "sku": str(r.get("sku", "")).strip(),
+                    "qty": str(r.get("qty", "")),
+                    "price": str(r.get("price", "")),
+                })
+
         except Exception as e:
             log_err(f"{fname}: parse error: {e}")
 
     out_csv = os.path.join(args.output, f"combined_{args.run_id}.csv")
-    if not combined_rows:
-        log_err("No rows parsed across all files")
-        # still write an empty CSV with header so downstream can see a file
-        write_csv([], out_csv)
-        return 3  # non-zero → API marks as failed
 
-    write_csv(combined_rows, out_csv)
-    log_out(f"Wrote {len(combined_rows)} rows to {out_csv}")
+    try:
+        write_combined(combined_rows, out_csv)
+    except Exception as e:
+        log_err(f"CSV write error: {e}")
+        return 2
+
+    if not combined_rows:
+        # Header-only CSV was written; signal failure so orchestrator marks job failed
+        log_err("No rows parsed across all files")
+        return 3
+
+    log_out(f"Wrote {len(combined_rows)} rows → {out_csv}")
     return 0
 
+
 if __name__ == "__main__":
-    code = main()
-    sys.exit(code)
+    sys.exit(main())
