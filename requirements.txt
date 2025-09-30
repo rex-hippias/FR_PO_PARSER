@@ -1,7 +1,6 @@
-fastapi
-uvicorn
-requests
-pandas
-pdfplumber
-pydantic
-pypdf
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+requests==2.32.3
+pypdf==4.3.1
+pandas==2.2.2
+python-multipart==0.0.9
