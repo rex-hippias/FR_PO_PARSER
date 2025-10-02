@@ -2,7 +2,7 @@ from __future__ import annotations
 import csv, os
 from typing import List, Dict
 
-# Exact header order you requested:
+# Exact header order required:
 FIELDNAMES = [
     "Order Number",
     "Part Number",
