@@ -1,25 +1,38 @@
-# writers/combined_csv.py
 from __future__ import annotations
-
-import csv
-import os
+import csv, os
 from typing import List, Dict
 
-# Expected normalized keys incoming from run_agent:
-FIELDNAMES = ["po_number", "file_name", "line_number", "sku", "qty", "price"]
+# Exact header order you requested:
+FIELDNAMES = [
+    "Order Number",
+    "Part Number",
+    "Description",
+    "Ordered",
+    "Ship-To",
+    "Delivery Date",
+    "Source File",
+    "Page",
+]
 
 def write_combined_csv(out_path: str, rows: List[Dict[str, str]]) -> str:
     """
-    Write the combined CSV to `out_path` from in-memory rows.
-    Returns the path written.
+    Input rows must already contain keys:
+      order_number, part_number, description, ordered, ship_to, delivery_date, source_file, page
     """
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
-    with open(out_path, "w", newline="") as f:
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=FIELDNAMES)
         w.writeheader()
         for r in rows:
-            # ensure all expected fields exist
-            w.writerow({k: (r.get(k, "") or "") for k in FIELDNAMES})
-
+            w.writerow({
+                "Order Number":  r.get("order_number", ""),
+                "Part Number":   r.get("part_number", ""),
+                "Description":   r.get("description", ""),
+                "Ordered":       r.get("ordered", ""),
+                "Ship-To":       r.get("ship_to", ""),
+                "Delivery Date": r.get("delivery_date", ""),
+                "Source File":   r.get("source_file", ""),
+                "Page":          r.get("page", ""),
+            })
     return out_path
