@@ -2,7 +2,7 @@ from __future__ import annotations
 import re
 from typing import List, Dict, Tuple, Optional
 
-# --- Heuristics & patterns ---
+# --- Heuristics & patterns (tuned to your sample) ---
 HEADER_HINTS = re.compile(
     r"(?:^|\b)(part\s*number|item|sku|description|qty|quantity|unit\s*(?:price|cost)|extension|amount|total|ordered)(?:\b|$)",
     re.I,
@@ -12,17 +12,18 @@ STOP_HINTS = re.compile(
     re.I,
 )
 
-# Money, qty, tokens with positions
+# "$1,234.00" or "(1,234.00)"
 MONEY_RX = re.compile(r"\$?\(?\s*\d{1,3}(?:,\d{3})*(?:\.\d{2,4})?\)?")
-# strictly "standalone" numeric (won't grab the 500 from "Case500E")
+# standalone quantity (won’t grab digits embedded in words like "Case500E")
 NUM_TOKEN = re.compile(r"(?<![A-Za-z0-9])\d+(?:\.\d+)?(?![A-Za-z0-9])")
 
-# Strict sample style: 0605-#### ; allow broader code fallback
+# Part number styles
 SKU_STRICT_RX = re.compile(r"\b\d{3,5}-[A-Za-z0-9#]+\b")   # e.g., 0605-2507104
 SKU_LOOSE_RX  = re.compile(r"\b[A-Z0-9][A-Z0-9\-\./]{2,}\b")
 
-# UOM-like “word+digits(+word)”, e.g., Case500E
-UOM_RX = re.compile(r"\b[A-Za-z]{2,}\d{2,}[A-Za-z]*\b")
+# UOM-like tokens, e.g., Case500E, CS500, PK12, etc.
+UOM_RX = re.compile(r"\b(?:case|cs|pk|ea|each|bx|bag|ct|carton|pallet|tray|sleeve)[A-Za-z]*\d*[A-Za-z0-9]*\b", re.I)
+UOM_GENERIC_RX = re.compile(r"\b[A-Za-z]{2,}\d{2,}[A-Za-z]*\b")
 
 def _clean_money(s: str) -> str:
     s = s.strip().replace("$", "").replace(",", "")
@@ -42,7 +43,7 @@ def _has_money(s: str) -> bool:
 def _merge_wrapped_lines(lines: List[str]) -> List[str]:
     """
     Join description lines with the following line when the first line has no $ amount yet.
-    Fits the sample where desc is on one line and the numeric tail is on the next.
+    Fits the sample where desc is on one line and numeric tail is on the next.
     """
     merged: List[str] = []
     buf: Optional[str] = None
@@ -59,6 +60,7 @@ def _merge_wrapped_lines(lines: List[str]) -> List[str]:
         else:
             ln2 = (buf + " " + ln).strip()
             if not _has_money(ln2):
+                # still no money → keep accumulating
                 buf = ln2
             else:
                 merged.append(ln2)
@@ -70,10 +72,15 @@ def _merge_wrapped_lines(lines: List[str]) -> List[str]:
 
 def _extract_positions(line: str):
     monies = [(m.start(), m.end(), _clean_money(m.group(0))) for m in MONEY_RX.finditer(line)]
+    # prefer strict SKU, fallback to loose
     skus   = [(m.start(), m.end(), m.group(0)) for m in SKU_STRICT_RX.finditer(line)]
-    if not skus:  # fallback
+    if not skus:
         skus = [(m.start(), m.end(), m.group(0)) for m in SKU_LOOSE_RX.finditer(line)]
+    # UOMs
     uoms   = [(m.start(), m.end(), m.group(0)) for m in UOM_RX.finditer(line)]
+    if not uoms:
+        uoms = [(m.start(), m.end(), m.group(0)) for m in UOM_GENERIC_RX.finditer(line)]
+    # numeric tokens (qty candidates)
     nums   = [(m.start(), m.end(), m.group(0)) for m in NUM_TOKEN.finditer(line)]
     return monies, skus, uoms, nums
 
@@ -113,10 +120,26 @@ def _find_sku_pos(line: str) -> Tuple[str, int]:
 
 def _find_last_uom_before(line: str, cutoff: int) -> Tuple[str, int]:
     last = ("", 10**9)
-    for m in UOM_RX.finditer(line):
+    for m in (UOM_RX.finditer(line) or []):
         if m.end() <= cutoff:
             last = (m.group(0), m.start())
+    # also consider generic UOM-ish tokens
+    for m in (UOM_GENERIC_RX.finditer(line) or []):
+        if m.end() <= cutoff and m.start() < last[1]:
+            last = (m.group(0), m.start())
     return last
+
+def _strip_description(line: str, pos_qty: int, pos_ext: int, pos_unit: int, pos_sku: int, pos_uom: int) -> str:
+    """
+    Trim description at the earliest tail token and also remove any lingering 'Case####' or UOM hash.
+    """
+    candidates = [p for p in (pos_qty, pos_ext, pos_unit, pos_sku, pos_uom) if p < 10**9]
+    cut_at = min(candidates) if candidates else len(line)
+    desc = line[:cut_at].strip()
+    # scrub common UOM noise from the right end if it slipped into the desc
+    desc = re.sub(r"\s+(?:Case|CS|PK|EA|Each|BX|Bag|CT|Carton|Pallet|Tray|Sleeve)\w*\s*$", "", desc, flags=re.I)
+    desc = re.sub(r"\s+[A-Za-z]{2,}\d{2,}[A-Za-z]*\s*$", "", desc)  # generic “word+digits”
+    return desc.strip(" -–•\t")
 
 def parse_single_page(full_text: str) -> List[Dict[str, str]]:
     """
@@ -128,7 +151,7 @@ def parse_single_page(full_text: str) -> List[Dict[str, str]]:
     if not lines:
         return rows
 
-    # 1) find header
+    # 1) find header-ish line and scan below it
     hidx = _find_header_index(lines)
     scan = lines[hidx + 1 :]
 
@@ -149,25 +172,21 @@ def parse_single_page(full_text: str) -> List[Dict[str, str]]:
         if not _has_money(ln):
             continue
 
-        qty, ext, unit, pos_qty, pos_ext, pos_unit, pos_first_money = _pick_tail_fields(ln)
-        sku, pos_sku = _find_sku_pos(ln)
-        uom, pos_uom = _find_last_uom_before(ln, pos_first_money)
+        qty, ext, unit, p_qty, p_ext, p_unit, p_first = _pick_tail_fields(ln)
+        sku, p_sku = _find_sku_pos(ln)
+        uom, p_uom = _find_last_uom_before(ln, p_first)
 
-        # Choose the earliest "tail token" start to trim description
-        candidates = [p for p in (pos_qty, pos_ext, pos_unit, pos_sku, pos_uom) if p < 10**9]
-        cut_at = min(candidates) if candidates else len(ln)
+        desc = _strip_description(ln, p_qty, p_ext, p_unit, p_sku, p_uom)
 
-        desc = ln[:cut_at].strip()
-
-        # Minimal acceptance: at least one of qty/ext/unit/sku
-        if not (qty or ext or unit or sku):
+        # accept if any meaningful fields present
+        if not (qty or unit or ext or sku):
             continue
 
         rows.append({
             "sku": sku,
             "qty": qty,
-            "price": unit,     # unit price
-            "ext": ext,        # extension (line total)
+            "price": unit,     # unit price (not used by your final CSV but retained)
+            "ext": ext,        # extension
             "uom": uom,
             "description": desc,
         })
