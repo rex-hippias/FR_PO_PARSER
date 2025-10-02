@@ -1,207 +1,141 @@
+# parsers/single_page.py
+from __future__ import annotations
+
 import re
-from typing import List, Dict, Tuple
+from typing import List, Dict
 
-# ---------- helpers ----------
-MONEY_RX = re.compile(r"\$?\s*\d{1,3}(?:,\d{3})*(?:\.\d{2})?")
-INT_RX   = re.compile(r"\d+")
-QTY_RX   = re.compile(r"\d+(?:\.\d+)?")  # allow decimal qty
+# Heuristics for finding the table header and the end of the item table
+HEADER_HINTS = re.compile(
+    r"(?:^|\b)(line\s*#?|item|sku|description|qty|quantity|unit\s*(?:price|cost)|ext(?:ended)?\s*price)(?:\b|$)",
+    re.I,
+)
+TOTAL_HINTS = re.compile(r"\b(subtotal|total|tax|freight|grand\s*total)\b", re.I)
 
-def clean_money(s: str) -> str:
-    # Keep digits, comma, dot; strip $ and spaces
-    s = s.strip()
-    s = re.sub(r"[^\d\.,]", "", s)
-    # normalize leading comma-only to digits
-    return s
+# Money/qty/sku helpers
+MONEY_RX = re.compile(r"-?\$?\s*\d{1,3}(?:,\d{3})*(?:\.\d{2})?")
+QTY_RX   = re.compile(r"\b\d+(?:\.\d+)?\b")
+SKU_RX   = re.compile(r"[A-Z0-9][A-Z0-9\-\./]{2,}")
 
-def clean_qty(s: str) -> str:
-    # strip UOM like "EA", "CS", etc.
-    m = QTY_RX.search(s)
-    return m.group(0) if m else ""
-
-def is_total_like(s: str) -> bool:
-    s = s.lower()
-    return any(k in s for k in ("subtotal", "total", "tax", "freight", "grand total"))
-
-# ---------- header detection ----------
-HEADER_ALIASES = {
-    "line": {"line", "line#", "ln", "ln#", "ln no", "line no", "line number"},
-    "item": {"item", "sku", "item#", "item no", "item number", "product", "code"},
-    "desc": {"desc", "description", "item description", "prod desc"},
-    "qty":  {"qty", "quantity", "order qty", "ordered", "ord qty"},
-    "unit": {"unit", "unit price", "price", "u.price", "unit cost", "cost"},
-    "ext":  {"extended", "ext", "ext price", "amount", "line total", "extended price"},
-}
-
-def normalize_token(t: str) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", t.lower()).strip()
-
-def header_columns(header_line: str) -> List[str]:
-    """
-    Given a header line string, return a list of canonical columns in order,
-    chosen from: line, item, desc, qty, unit, ext
-    """
-    # split on 2+ spaces to get tokens
-    toks = [normalize_token(t) for t in re.split(r"\s{2,}", header_line) if t.strip()]
-    cols: List[str] = []
-    for t in toks:
-        mapped = None
-        for canon, aliases in HEADER_ALIASES.items():
-            if any(a in t for a in aliases):
-                mapped = canon
-                break
-        cols.append(mapped or t)  # keep unmapped tokens so positions align
-    return cols
-
-def find_header(lines: List[str]) -> Tuple[int, List[str]]:
-    """
-    Return (header_index, cols) or (-1, []) if not found.
-    """
-    for idx, raw in enumerate(lines):
-        line = raw.strip()
-        if not line:
-            continue
-        # require at least 3 header-like keywords present
-        l = normalize_token(line)
-        hits = sum(
-            any(a in l for a in aliases)
-            for aliases in HEADER_ALIASES.values()
-        )
-        if hits >= 3:
-            cols = header_columns(line)
-            return idx, cols
-    return -1, []
-
-# ---------- row parsing ----------
-def parse_with_columns(lines: List[str], start_idx: int, cols: List[str]) -> List[Dict[str, str]]:
-    """
-    Parse rows under a detected header by splitting each line on 2+ spaces
-    and mapping to the known columns. Stops when reaching totals section or blank block.
-    """
-    rows: List[Dict[str, str]] = []
-    for raw in lines[start_idx+1:]:
-        if not raw.strip():
-            # allow sparse blank lines; continue unless we've already captured rows and see two blanks
-            # (simple heuristic: break on first blank after we've started, but keep going initially)
-            if rows:
-                break
-            else:
-                continue
-        if is_total_like(raw):
-            break
-
-        parts = [p.strip() for p in re.split(r"\s{2,}", raw.strip()) if p.strip()]
-        # Some PDFs collapse multiple spaces; if we didn't split enough, skip to regex fallback later
-        if len(parts) < 3:
-            continue
-
-        # Map according to detected columns
-        # Build a dict with possible fields
-        data: Dict[str, str] = {"line_number": "", "sku": "", "qty": "", "price": ""}
-
-        # Determine indices by best-effort lookup
-        def idx_of(canon: str) -> int:
-            try:
-                return cols.index(canon)
-            except ValueError:
-                return -1
-
-        i_line = idx_of("line")
-        i_item = idx_of("item")
-        i_desc = idx_of("desc")
-        i_qty  = idx_of("qty")
-        i_unit = idx_of("unit")
-        i_ext  = idx_of("ext")
-
-        # Use ext price if unit missing; prefer unit for "price" field
-        price_src = None
-        if i_unit != -1 and i_unit < len(parts):
-            price_src = parts[i_unit]
-        elif i_ext != -1 and i_ext < len(parts):
-            price_src = parts[i_ext]
-        else:
-            # fallback: last token that looks like money
-            cand = [p for p in parts if MONEY_RX.fullmatch(p)]
-            price_src = cand[-1] if cand else parts[-1]
-
-        # Qty
-        qty_src = ""
-        if i_qty != -1 and i_qty < len(parts):
-            qty_src = parts[i_qty]
-        else:
-            # guess: the token before price often is qty
-            if len(parts) >= 2:
-                qty_src = parts[-2]
-
-        # Item/Desc
-        item_src = ""
-        if i_item != -1 and i_item < len(parts):
-            item_src = parts[i_item]
-        elif i_desc != -1 and i_desc < len(parts):
-            item_src = parts[i_desc]
-        else:
-            # everything between (line?) and (qty/price) could be description
-            # heuristic: join middle tokens excluding first and last 1–2
-            mid = parts[1:-2] if len(parts) > 3 else parts[1:-1]
-            item_src = " ".join(mid).strip()
-
-        # Line number
-        line_src = ""
-        if i_line != -1 and i_line < len(parts):
-            line_src = parts[i_line]
-        else:
-            # often first token
-            line_src = parts[0]
-
-        data["line_number"] = re.sub(r"[^\d]", "", line_src)[:6]
-        data["sku"] = item_src
-        data["qty"] = clean_qty(qty_src)
-        data["price"] = clean_money(price_src)
-
-        # sanity: need at least qty or price to consider it a line
-        if data["qty"] or data["price"]:
-            rows.append(data)
-
-    return rows
-
-# ---------- regex fallback (from your earlier version, a bit looser) ----------
-LINE_PATTERNS = [
-    # line  desc/sku         qty    price [ext optional]
-    re.compile(r"^\s*(\d{1,4})\s+([^\d].*?)\s+(\d+(?:\.\d+)?)\s+(\$?\d[\d,]*\.\d{2})(?:\s+\$?\d[\d,]*\.\d{2})?\s*$"),
-    # line  SKU               qty    price
-    re.compile(r"^\s*(\d{1,4})\s+([A-Z0-9][A-Z0-9\-_\/]+)\s+(\d+(?:\.\d+)?)\s+(\$?\d[\d,]*\.\d{2})\s*$"),
-    # alt ordering: line qty desc price
-    re.compile(r"^\s*(\d{1,4})\s+(\d+(?:\.\d+)?)\s+([^\d].*?)\s+(\$?\d[\d,]*\.\d{2})\s*$"),
+# Primary line regex (common layout): line  sku  description  qty  unit-price  ext-price
+LINE_RXES = [
+    re.compile(
+        r"^\s*(?P<line>\d{1,4})\s+"
+        r"(?P<sku>[A-Z0-9][A-Z0-9\-\./]{2,})\s+"
+        r"(?P<desc>.+?)\s+"
+        r"(?P<qty>\d+(?:\.\d+)?)\s+"
+        r"(?P<price>-?\$?\s*\d{1,3}(?:,\d{3})*(?:\.\d{2})?)"
+        r"(?:\s+(?P<ext>-?\$?\s*\d{1,3}(?:,\d{3})*(?:\.\d{2})?))?\s*$",
+        re.I,
+    ),
+    # Variant: line [desc chunks ...] sku qty price (some vendors swap order)
+    re.compile(
+        r"^\s*(?P<line>\d{1,4})\s+"
+        r"(?P<desc>.+?)\s+"
+        r"(?P<sku>[A-Z0-9][A-Z0-9\-\./]{2,})\s+"
+        r"(?P<qty>\d+(?:\.\d+)?)\s+"
+        r"(?P<price>-?\$?\s*\d{1,3}(?:,\d{3})*(?:\.\d{2})?)\s*$",
+        re.I,
+    ),
 ]
 
-def parse_by_regex(all_lines: List[str]) -> List[Dict[str, str]]:
-    rows: List[Dict[str, str]] = []
-    for raw in all_lines:
-        line = raw.strip()
-        if not line or is_total_like(line):
-            continue
-        for pat in LINE_PATTERNS:
-            m = pat.match(line)
-            if m:
-                ln, item, qty, price = m.group(1, 2, 3, 4)
-                rows.append({
-                    "line_number": re.sub(r"[^\d]", "", ln),
-                    "sku": item.strip(),
-                    "qty": clean_qty(qty),
-                    "price": clean_money(price),
-                })
-                break
-    return rows
+def _is_header(line: str) -> bool:
+    return bool(HEADER_HINTS.search(line))
 
-# ---------- main entry ----------
-def parse_single_page(text: str) -> List[Dict[str, str]]:
+def _is_totals(line: str) -> bool:
+    return bool(TOTAL_HINTS.search(line))
+
+def _clean_money(s: str) -> str:
+    s = s.replace("$", "").replace(",", "").strip()
+    return s
+
+def _split_columns(line: str) -> List[str]:
+    # Split on 2+ spaces to approximate columns
+    parts = re.split(r"\s{2,}", line.strip())
+    return [p for p in parts if p]
+
+def _parse_line(line: str) -> Dict[str, str] | None:
+    # 1) Try regexes
+    for rx in LINE_RXES:
+        m = rx.match(line)
+        if m:
+            gd = m.groupdict()
+            line_number = gd.get("line", "") or ""
+            sku = gd.get("sku", "") or ""
+            qty = gd.get("qty", "") or ""
+            price = _clean_money(gd.get("price", "") or "")
+            desc = (gd.get("desc", "") or "").strip()
+            if desc and len(desc) <= 2 and sku and not SKU_RX.fullmatch(desc):
+                # extremely short desc likely not real; ignore
+                desc = ""
+            return {
+                "line_number": line_number.strip(),
+                "sku": sku.strip(),
+                "qty": qty.strip(),
+                "price": price,
+                "description": desc,
+            }
+
+    # 2) Fallback: split columns
+    cols = _split_columns(line)
+    if len(cols) >= 4:
+        # Heuristic: first col numeric → line; last money → price; somewhere numeric → qty; one token looking like SKU
+        cand_line = cols[0] if cols and cols[0].strip().isdigit() else ""
+        cand_price = ""
+        # look from the end for money
+        for tok in reversed(cols):
+            if MONEY_RX.search(tok):
+                cand_price = _clean_money(MONEY_RX.search(tok).group(0))
+                break
+        # find qty (a number) preferring tokens before price
+        cand_qty = ""
+        for tok in cols:
+            if QTY_RX.fullmatch(tok.strip()):
+                cand_qty = tok.strip()
+        # identify sku among tokens
+        cand_sku = ""
+        for tok in cols:
+            t = tok.strip()
+            if SKU_RX.fullmatch(t):
+                cand_sku = t
+                break
+        # build a description from middle tokens not used by line/qty/price
+        used = {cand_line, cand_sku, cand_qty}
+        middle = [t for t in cols[1:-1] if t not in used]
+        desc = " ".join(middle).strip()
+        if cand_price or cand_qty or cand_sku:
+            return {
+                "line_number": cand_line,
+                "sku": cand_sku,
+                "qty": cand_qty,
+                "price": cand_price,
+                "description": desc,
+            }
+
+    return None
+
+def parse_single_page(full_text: str) -> List[Dict[str, str]]:
     """
-    Attempts header-aware parsing first, then falls back to regex scanning.
+    Parse a single-page PO text into line-item rows.
+    Returns a list of dicts with keys: line_number, sku, qty, price, description.
     """
-    lines = text.splitlines()
-    h_idx, cols = find_header(lines)
-    if h_idx != -1:
-        rows = parse_with_columns(lines, h_idx, cols)
-        if rows:
-            return rows
-    # fallback
-    return parse_by_regex(lines)
+    lines = full_text.splitlines()
+    rows: List[Dict[str, str]] = []
+
+    # Find header row
+    start = 0
+    for i, ln in enumerate(lines):
+        if _is_header(ln):
+            start = i
+            break
+
+    # Scan forward until totals or end
+    for ln in lines[start+1:]:
+        if not ln.strip():
+            continue
+        if _is_totals(ln):
+            break
+        rec = _parse_line(ln)
+        if rec:
+            rows.append(rec)
+
+    return rows
