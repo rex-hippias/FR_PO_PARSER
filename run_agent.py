@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
 """
-run_agent.py
+FR PO Agent → Combined CSV
+
 - Reads PDFs
-- Parses item rows per page with parsers.single_page
-- Enriches each row with: Order Number, Ship-To (City, ST), Delivery Date, Source File, Page
-- Writes final CSV with required header order via writers.combined_csv
+- Parses line items (parsers.single_page.parse_single_page)
+- Enriches with: Order Number, Ship-To (City, ST), Delivery Date, Source File, Page
+- Writes final CSV (writers.combined_csv)
+
+ENV:
+  DEBUG_DUMPS=1           # write trimmed/full text debug
+  FULL_DEBUG=0            # include full text debug
+  DEBUG_REDACT=1          # redact long numbers in debug
+  MAX_DEBUG_LINES=200
+  SHIPTO_DENYLIST="Rochester, NY;Vendor City, ST"   # semicolon-separated
 """
 
 import argparse, os, re, sys
@@ -19,6 +27,10 @@ DEBUG_DUMPS     = os.getenv("DEBUG_DUMPS", "1") == "1"
 FULL_DEBUG      = os.getenv("FULL_DEBUG", "0") == "1"
 DEBUG_REDACT    = os.getenv("DEBUG_REDACT", "1") == "1"
 MAX_DEBUG_LINES = int(os.getenv("MAX_DEBUG_LINES", "200"))
+
+# Default denylist excludes vendor HQ (adjust via env)
+_deny = os.getenv("SHIPTO_DENYLIST", "Rochester, NY").split(";")
+SHIPTO_DENYLIST = {s.strip().upper() for s in _deny if s.strip()}
 # -------------------------------
 
 def _ensure_dir(d: str) -> None:
@@ -57,7 +69,7 @@ def _maybe_redact(s: str) -> str:
     return REDACT_RX.sub("[#]", s) if DEBUG_REDACT else s
 # ---------------------
 
-# --- Metadata extractors ---
+# --- Metadata extractors (more robust) ---
 FILENAME_PO_RX = re.compile(r"\b(\d{4}-\d{2}-\d{5})\b")
 
 TEXT_PO_RXES = [
@@ -67,17 +79,25 @@ TEXT_PO_RXES = [
 ]
 
 CITY_ST_RX = re.compile(r"\b([A-Za-z][A-Za-z .'\-]+),\s*([A-Z]{2})\b")
-SHIP_TO_LABEL_RX = re.compile(r"(?i)ship[\s\-]*to\b")
-BILL_TO_LABEL_RX = re.compile(r"(?i)bill[\s\-]*to\b")
 
-DATE_LABELED_RXES = [
-    re.compile(r"(?i)\b(?:delivery\s*date|deliver\s*by|required\s*date)[:\s]*([0-1]?\d/[0-3]?\d/(?:\d{2}|\d{4}))"),
-    re.compile(r"(?i)\b(?:delivery\s*date|deliver\s*by|required\s*date)[:\s]*([A-Za-z]{3,9}\s+\d{1,2},\s+\d{4})"),
-]
-DATE_GENERIC_RXES = [
-    re.compile(r"\b(0?[1-9]|1[0-2])[\/\-](0?[1-9]|[12][0-9]|3[01])[\/\-](\d{2}|\d{4})\b"),
-    re.compile(r"\b([A-Za-z]{3,9}\s+\d{1,2},\s+\d{4})\b"),
-]
+SHIP_TO_LABEL_RX = re.compile(r"(?i)\b(ship[\s\-]*to|shipping\s*address|deliver\s*to)\b")
+# Things that typically end the Ship-To block
+SHIP_TO_STOP_RX  = re.compile(
+    r"(?i)\b(bill[\s\-]*to|sold[\s\-]*to|remit|vendor|po\s*#|purchase\s*order|terms|phone|fax|email|receiving\s*hours|notes?|comments?|delivery\s*date|required\s*date|ship\s*via)\b"
+)
+
+# Delivery date labels we accept
+DATE_LABEL_RX = re.compile(
+    r"(?i)\b(delivery\s*date|deliver\s*by|required\s*(?:on|by|date)|need\s*by|due\s*date|arrival\s*date|eta)\b"
+)
+
+# Date formats
+DATE_NUM = r"(?:0?[1-9]|1[0-2])[\/\-\.](?:0?[1-9]|[12][0-9]|3[01])[\/\-](?:\d{4}|\d{2})"
+DATE_WORD = r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2},\s+\d{4}"
+DATE_ANY_RX = re.compile(rf"(?:{DATE_WORD}|{DATE_NUM})")
+
+# Dates we do NOT want (common noise)
+NOISY_DATE_LABELS = re.compile(r"(?i)\b(po\s*date|invoice\s*date|order\s*date|print\s*date|run\s*date)\b")
 
 def guess_po_number(full_text: str, filename: str) -> str:
     base = os.path.basename(filename)
@@ -90,35 +110,76 @@ def guess_po_number(full_text: str, filename: str) -> str:
             return t.group(1)
     return ""
 
+def _slice_after_label(text: str, start_rx: re.Pattern, stop_rx: re.Pattern, max_len: int = 1200) -> str:
+    """
+    Return a slice of text starting at the end of the start label
+    and ending at the next stop label (or max_len).
+    """
+    if not text:
+        return ""
+    m = start_rx.search(text)
+    if not m:
+        return ""
+    start = m.end()
+    sub = text[start : min(len(text), start + max_len)]
+    m2 = stop_rx.search(sub)
+    return sub[: m2.start()] if m2 else sub
+
 def extract_ship_to_city_state(full_text: str) -> str:
-    text = full_text or ""
-    m = SHIP_TO_LABEL_RX.search(text)
-    if m:
-        start = m.end()
-        m2 = BILL_TO_LABEL_RX.search(text, pos=start)
-        end = m2.start() if m2 else min(len(text), start + 400)
-        block = text[start:end]
-        city_state = re.findall(r"([A-Za-z][A-Za-z .'\-]+,\s*[A-Z]{2})\b", block)
-        if city_state:
-            return city_state[-1].strip()
-    # fallback: first city/state anywhere
-    mcs2 = CITY_ST_RX.search(text)
-    return f"{mcs2.group(1).strip()}, {mcs2.group(2)}" if mcs2 else ""
+    """
+    Prefer City, ST from the explicit Ship-To block.
+    Fall back to any City, ST in the doc that is NOT in the denylist.
+    """
+    txt = full_text or ""
+
+    block = _slice_after_label(txt, SHIP_TO_LABEL_RX, SHIP_TO_STOP_RX, max_len=1600)
+    candidates = [f"{m.group(1).strip()}, {m.group(2)}" for m in CITY_ST_RX.finditer(block)]
+    # prefer the last in the Ship-To block (often the bottom line)
+    for cand in reversed(candidates):
+        if cand.upper() not in SHIPTO_DENYLIST:
+            return cand
+
+    # Fallback: search entire doc but ignore header/footer noise
+    # Heuristic: prioritize City,ST occurrences that appear AFTER a Ship/Deliver hint.
+    prefscope = _slice_after_label(txt, re.compile(r"(?i)\b(ship|deliver)\b"), SHIP_TO_STOP_RX, max_len=3000)
+    scope_list = [prefscope, txt]
+    for scope in scope_list:
+        for m in CITY_ST_RX.finditer(scope or ""):
+            cand = f"{m.group(1).strip()}, {m.group(2)}"
+            if cand.upper() not in SHIPTO_DENYLIST:
+                return cand
+
+    return ""  # as a last resort, leave blank rather than returning vendor city
 
 def extract_delivery_date(full_text: str) -> str:
+    """
+    Look for a labeled delivery/need-by field. Avoid PO/Invoice dates.
+    """
     txt = full_text or ""
-    for rx in DATE_LABELED_RXES:
-        m = rx.search(txt)
-        if m:
-            return m.group(1).strip()
-    near = re.search(r"(?i)(deliver|ship|required|arrival|eta)[:\s\-]{0,20}([\s\S]{0,120})", txt)
-    scope = near.group(2) if near else txt
-    for rx in DATE_GENERIC_RXES:
-        m = rx.search(scope)
-        if m:
-            return m.group(0).strip()
+
+    # 1) Labeled capture: <label> : <date>
+    labeled = re.search(rf"{DATE_LABEL_RX.pattern}\s*[:\-–]?\s*({DATE_ANY_RX.pattern})", txt)
+    if labeled:
+        # The date is in the last group
+        return labeled.group(len(labeled.groups()))
+
+    # 2) Nearby strategy: find a label, then take the first date within ~120 chars after it
+    for m in DATE_LABEL_RX.finditer(txt):
+        window = txt[m.end(): m.end()+160]
+        d = DATE_ANY_RX.search(window)
+        if d:
+            return d.group(0)
+
+    # 3) Generic: find dates that are NOT preceded by noisy labels
+    for d in DATE_ANY_RX.finditer(txt):
+        # get a small prefix to check for noisy labels
+        prefix_start = max(0, d.start() - 30)
+        prefix = txt[prefix_start:d.start()]
+        if not NOISY_DATE_LABELS.search(prefix):
+            return d.group(0)
+
     return ""
-# ----------------------------
+# ---------------------------------------
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="FR PO Agent → Combined CSV")
@@ -159,6 +220,9 @@ def main() -> int:
             order_number  = guess_po_number(full_text, fname)
             ship_to_cs    = extract_ship_to_city_state(full_text)  # "City, ST"
             delivery_date = extract_delivery_date(full_text)
+
+            # Log chosen meta for troubleshooting
+            print(f"[meta] file={fname} order={order_number} ship_to='{ship_to_cs}' delivery='{delivery_date}'", flush=True)
 
             # Parse per-page to attach Page number
             for page_idx, page_text in enumerate(pages, start=1):
