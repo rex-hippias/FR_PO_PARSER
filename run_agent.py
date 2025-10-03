@@ -1,255 +1,471 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 """
-FR PO Agent → Combined CSV
-
-- Reads PDFs
-- Parses line items (parsers.single_page.parse_single_page)
-- Enriches with: Order Number, Ship-To (City, ST), Delivery Date, Source File, Page
-- Writes final CSV (writers.combined_csv)
-
-ENV:
-  DEBUG_DUMPS=1           # write trimmed/full text debug
-  FULL_DEBUG=0            # include full text debug
-  DEBUG_REDACT=1          # redact long numbers in debug
-  MAX_DEBUG_LINES=200
-  SHIPTO_DENYLIST="Rochester, NY;Vendor City, ST"   # semicolon-separated
+Orchestrates a PO parsing run:
+- Downloads all input_urls into /tmp/<RUN-ID>/input
+- Detects PDFs by header/bytes (not just file extension)
+- Generates debug text dumps for each PDF
+- Invokes optional parsers (single_page / multi_page) if present
+- Produces output/combined_<RUN-ID>.csv with the expected headers
+- Writes structured stdout/stderr logs
+Exit codes:
+  0 = success (≥1 parsed rows)
+  3 = no rows parsed
+  1/2 = hard error
 """
 
-import argparse, os, re, sys
-from typing import List, Dict
-from pypdf import PdfReader
+from __future__ import annotations
 
-from parsers.single_page import parse_single_page
-from writers.combined_csv import write_combined_csv
+import argparse
+import csv
+import io
+import json
+import logging
+import mimetypes
+import os
+import re
+import sys
+import time
+from dataclasses import dataclass, asdict
+from typing import Iterable, List, Dict, Optional, Tuple
+from urllib.parse import urlparse
 
-# ---------- ENV knobs ----------
-DEBUG_DUMPS     = os.getenv("DEBUG_DUMPS", "1") == "1"
-FULL_DEBUG      = os.getenv("FULL_DEBUG", "0") == "1"
-DEBUG_REDACT    = os.getenv("DEBUG_REDACT", "1") == "1"
-MAX_DEBUG_LINES = int(os.getenv("MAX_DEBUG_LINES", "200"))
+# ---- Optional deps (available via requirements.txt) ----
+import requests
+from requests.adapters import HTTPAdapter, Retry
 
-# Default denylist excludes vendor HQ (adjust via env)
-_deny = os.getenv("SHIPTO_DENYLIST", "Rochester, NY").split(";")
-SHIPTO_DENYLIST = {s.strip().upper() for s in _deny if s.strip()}
-# -------------------------------
+try:
+    from pypdf import PdfReader  # for debug text & basic fallback text extraction
+except Exception:  # pragma: no cover
+    PdfReader = None
 
-def _ensure_dir(d: str) -> None:
+
+# ---------- CLI & paths ----------
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser()
+    p.add_argument("--run-id", required=True)
+    p.add_argument("--input", required=True, help="Input dir")
+    p.add_argument("--parsed", required=True, help="Parsed scratch dir")
+    p.add_argument("--output", required=True, help="Output dir")
+    p.add_argument("--logs", required=True, help="Logs dir")
+    p.add_argument("--debug", default=None, help="Debug dir (optional)")
+    p.add_argument("--order-number", default=None, help="Optional override for order number")
+    return p.parse_args()
+
+
+def ensure_dir(d: str) -> str:
     os.makedirs(d, exist_ok=True)
+    return d
 
-def read_pages(pdf_path: str) -> List[str]:
-    with open(pdf_path, "rb") as f:
-        r = PdfReader(f)
-        return [(p.extract_text() or "") for p in r.pages]
 
-# --- Debug helpers ---
-HEADER_HINTS = re.compile(
-    r"(?:^|\b)(part\s*number|item|sku|description|qty|quantity|unit\s*price|extension|amount|ordered)(?:\b|$)",
-    re.I,
-)
-TOTAL_HINTS = re.compile(r"\b(subtotal|total|tax|freight|grand\s*total|amount\s*due)\b", re.I)
-REDACT_RX   = re.compile(r"(?<!\d)\d{5,}(?!\d)")  # blunt redaction for long numbers
+# ---------- Logging to files AND console ----------
 
-def _trim_table_region(text: str) -> str:
-    lines = (text or "").splitlines()
-    header_idx = -1
-    for i, ln in enumerate(lines):
-        if HEADER_HINTS.search(ln or ""):
-            header_idx = i
-            break
-    if header_idx == -1:
-        return "\n".join(lines[:MAX_DEBUG_LINES])
-    out: List[str] = []
-    for ln in lines[header_idx: header_idx + MAX_DEBUG_LINES]:
-        out.append(ln)
-        if TOTAL_HINTS.search(ln or ""):
-            break
-    return "\n".join(out)
+def setup_logging(log_dir: str) -> Tuple[logging.Logger, io.StringIO, io.StringIO]:
+    ensure_dir(log_dir)
+    logger = logging.getLogger("agent")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
 
-def _maybe_redact(s: str) -> str:
-    return REDACT_RX.sub("[#]", s) if DEBUG_REDACT else s
-# ---------------------
+    stdout_buf = io.StringIO()
+    stderr_buf = io.StringIO()
 
-# --- Metadata extractors (more robust) ---
-FILENAME_PO_RX = re.compile(r"\b(\d{4}-\d{2}-\d{5})\b")
+    # Stream to real stdout/stderr
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setLevel(logging.INFO)
+    sh.setFormatter(logging.Formatter("%(message)s"))
 
-TEXT_PO_RXES = [
-    re.compile(r"(?i)purchase\s*order[:\s-]*\b(\d{4}-\d{2}-\d{5})\b"),
-    re.compile(r"(?i)order\s*number[:\s-]*\b(\d{4}-\d{2}-\d{5})\b"),
-    re.compile(r"(?i)\bpo\s*#?\s*[:\-]?\s*(\d{4}-\d{2}-\d{5})\b"),
-]
+    # File handler (same format)
+    fh = logging.FileHandler(os.path.join(log_dir, "agent.stdout.txt"), mode="w", encoding="utf-8")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(logging.Formatter("%(message)s"))
 
-CITY_ST_RX = re.compile(r"\b([A-Za-z][A-Za-z .'\-]+),\s*([A-Z]{2})\b")
+    # Separate error file
+    eh = logging.FileHandler(os.path.join(log_dir, "agent.stderr.txt"), mode="w", encoding="utf-8")
+    eh.setLevel(logging.WARNING)
+    eh.setFormatter(logging.Formatter("%(message)s"))
 
-SHIP_TO_LABEL_RX = re.compile(r"(?i)\b(ship[\s\-]*to|shipping\s*address|deliver\s*to)\b")
-# Things that typically end the Ship-To block
-SHIP_TO_STOP_RX  = re.compile(
-    r"(?i)\b(bill[\s\-]*to|sold[\s\-]*to|remit|vendor|po\s*#|purchase\s*order|terms|phone|fax|email|receiving\s*hours|notes?|comments?|delivery\s*date|required\s*date|ship\s*via)\b"
-)
+    logger.addHandler(sh)
+    logger.addHandler(fh)
+    logger.addHandler(eh)
+    return logger, stdout_buf, stderr_buf
 
-# Delivery date labels we accept
-DATE_LABEL_RX = re.compile(
-    r"(?i)\b(delivery\s*date|deliver\s*by|required\s*(?:on|by|date)|need\s*by|due\s*date|arrival\s*date|eta)\b"
-)
 
-# Date formats
-DATE_NUM = r"(?:0?[1-9]|1[0-2])[\/\-\.](?:0?[1-9]|[12][0-9]|3[01])[\/\-](?:\d{4}|\d{2})"
-DATE_WORD = r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2},\s+\d{4}"
-DATE_ANY_RX = re.compile(rf"(?:{DATE_WORD}|{DATE_NUM})")
+# ---------- HTTP utilities ----------
 
-# Dates we do NOT want (common noise)
-NOISY_DATE_LABELS = re.compile(r"(?i)\b(po\s*date|invoice\s*date|order\s*date|print\s*date|run\s*date)\b")
+def make_session() -> requests.Session:
+    s = requests.Session()
+    retries = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        backoff_factor=0.4,
+        status_forcelist=(408, 429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "HEAD"]),
+    )
+    s.mount("https://", HTTPAdapter(max_retries=retries))
+    s.mount("http://", HTTPAdapter(max_retries=retries))
+    s.headers.update({"User-Agent": "FR-PO-Agent/1.0"})
+    return s
 
-def guess_po_number(full_text: str, filename: str) -> str:
-    base = os.path.basename(filename)
-    m = FILENAME_PO_RX.search(base)
-    if m:
-        return m.group(1)
-    for rx in TEXT_PO_RXES:
-        t = rx.search(full_text or "")
-        if t:
-            return t.group(1)
-    return ""
 
-def _slice_after_label(text: str, start_rx: re.Pattern, stop_rx: re.Pattern, max_len: int = 1200) -> str:
-    """
-    Return a slice of text starting at the end of the start label
-    and ending at the next stop label (or max_len).
-    """
-    if not text:
-        return ""
-    m = start_rx.search(text)
-    if not m:
-        return ""
-    start = m.end()
-    sub = text[start : min(len(text), start + max_len)]
-    m2 = stop_rx.search(sub)
-    return sub[: m2.start()] if m2 else sub
+# ---------- PDF detection ----------
 
-def extract_ship_to_city_state(full_text: str) -> str:
-    """
-    Prefer City, ST from the explicit Ship-To block.
-    Fall back to any City, ST in the doc that is NOT in the denylist.
-    """
-    txt = full_text or ""
+def bytes_look_like_pdf(b: bytes) -> bool:
+    return b[:5] == b"%PDF-"
 
-    block = _slice_after_label(txt, SHIP_TO_LABEL_RX, SHIP_TO_STOP_RX, max_len=1600)
-    candidates = [f"{m.group(1).strip()}, {m.group(2)}" for m in CITY_ST_RX.finditer(block)]
-    # prefer the last in the Ship-To block (often the bottom line)
-    for cand in reversed(candidates):
-        if cand.upper() not in SHIPTO_DENYLIST:
-            return cand
 
-    # Fallback: search entire doc but ignore header/footer noise
-    # Heuristic: prioritize City,ST occurrences that appear AFTER a Ship/Deliver hint.
-    prefscope = _slice_after_label(txt, re.compile(r"(?i)\b(ship|deliver)\b"), SHIP_TO_STOP_RX, max_len=3000)
-    scope_list = [prefscope, txt]
-    for scope in scope_list:
-        for m in CITY_ST_RX.finditer(scope or ""):
-            cand = f"{m.group(1).strip()}, {m.group(2)}"
-            if cand.upper() not in SHIPTO_DENYLIST:
-                return cand
+def file_looks_like_pdf(path: str) -> bool:
+    try:
+        with open(path, "rb") as f:
+            return bytes_look_like_pdf(f.read(5))
+    except Exception:
+        return False
 
-    return ""  # as a last resort, leave blank rather than returning vendor city
 
-def extract_delivery_date(full_text: str) -> str:
-    """
-    Look for a labeled delivery/need-by field. Avoid PO/Invoice dates.
-    """
-    txt = full_text or ""
+# ---------- Download & intake ----------
 
-    # 1) Labeled capture: <label> : <date>
-    labeled = re.search(rf"{DATE_LABEL_RX.pattern}\s*[:\-–]?\s*({DATE_ANY_RX.pattern})", txt)
-    if labeled:
-        # The date is in the last group
-        return labeled.group(len(labeled.groups()))
+def filename_from_url(url: str, ix: int) -> str:
+    try:
+        name = os.path.basename(urlparse(url).path)
+        name = name or f"file_{ix+1}.pdf"
+        # strip query tokens
+        name = name.split("?")[0]
+    except Exception:
+        name = f"file_{ix+1}.pdf"
+    return name
 
-    # 2) Nearby strategy: find a label, then take the first date within ~120 chars after it
-    for m in DATE_LABEL_RX.finditer(txt):
-        window = txt[m.end(): m.end()+160]
-        d = DATE_ANY_RX.search(window)
-        if d:
-            return d.group(0)
 
-    # 3) Generic: find dates that are NOT preceded by noisy labels
-    for d in DATE_ANY_RX.finditer(txt):
-        # get a small prefix to check for noisy labels
-        prefix_start = max(0, d.start() - 30)
-        prefix = txt[prefix_start:d.start()]
-        if not NOISY_DATE_LABELS.search(prefix):
-            return d.group(0)
+def download_all(urls: List[str], input_dir: str, logger: logging.Logger) -> List[str]:
+    ensure_dir(input_dir)
+    session = make_session()
+    saved: List[str] = []
 
-    return ""
-# ---------------------------------------
+    for i, url in enumerate(urls):
+        if not url or not isinstance(url, str):
+            logger.warning(f"[download] skipping invalid url at index {i}")
+            continue
+        name = filename_from_url(url, i)
+        dst = os.path.join(input_dir, name)
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description="FR PO Agent → Combined CSV")
-    ap.add_argument("--run-id", required=True)
-    ap.add_argument("--input",  required=True)
-    ap.add_argument("--parsed", required=True)
-    ap.add_argument("--output", required=True)
-    ap.add_argument("--logs",   required=True)
-    args = ap.parse_args()
-
-    run_id, input_dir, parsed_dir, output_dir, logs_dir = args.run_id, args.input, args.parsed, args.output, args.logs
-    debug_dir = os.path.join(os.path.dirname(output_dir), "debug")
-    for d in (input_dir, parsed_dir, output_dir, logs_dir, debug_dir):
-        _ensure_dir(d)
-
-    pdfs = sorted([f for f in os.listdir(input_dir) if f.lower().endswith(".pdf")])
-    if not pdfs:
-        print("No PDF files found in input directory", file=sys.stderr, flush=True)
-        return 1
-
-    combined_rows: List[Dict[str, str]] = []
-
-    for fname in pdfs:
-        fpath = os.path.join(input_dir, fname)
         try:
-            pages = read_pages(fpath)
-            full_text = "\n".join(pages)
+            with session.get(url, stream=True, timeout=60) as r:
+                r.raise_for_status()
+                # Guess by header first
+                ctype = r.headers.get("content-type", "").split(";")[0].strip().lower()
+                # Write to disk
+                with open(dst, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=65536):
+                        if chunk:
+                            f.write(chunk)
 
-            # Debug dumps
-            if DEBUG_DUMPS:
-                trimmed = _maybe_redact(_trim_table_region(full_text))
-                with open(os.path.join(debug_dir, f"po_text_trimmed_{fname}.txt"), "w", encoding="utf-8", errors="ignore") as dbg:
-                    dbg.write(trimmed)
-                if FULL_DEBUG:
-                    with open(os.path.join(debug_dir, f"po_text_full_{fname}.txt"), "w", encoding="utf-8", errors="ignore") as dbg:
-                        dbg.write(_maybe_redact(full_text))
+            # Content sniff
+            if not dst.lower().endswith(".pdf"):
+                # rename if it actually looks like PDF
+                if file_looks_like_pdf(dst) or ctype == "application/pdf":
+                    new_dst = dst + ".pdf"
+                    os.replace(dst, new_dst)
+                    dst = new_dst
 
-            order_number  = guess_po_number(full_text, fname)
-            ship_to_cs    = extract_ship_to_city_state(full_text)  # "City, ST"
-            delivery_date = extract_delivery_date(full_text)
-
-            # Log chosen meta for troubleshooting
-            print(f"[meta] file={fname} order={order_number} ship_to='{ship_to_cs}' delivery='{delivery_date}'", flush=True)
-
-            # Parse per-page to attach Page number
-            for page_idx, page_text in enumerate(pages, start=1):
-                rows = parse_single_page(page_text)
-                for r in rows:
-                    combined_rows.append({
-                        "order_number":  order_number,
-                        "part_number":   (r.get("sku") or "").strip(),
-                        "description":   (r.get("description") or "").strip(),
-                        "ordered":       (r.get("qty") or "").strip(),
-                        "ship_to":       ship_to_cs,
-                        "delivery_date": delivery_date,
-                        "source_file":   fname,
-                        "page":          str(page_idx),
-                    })
+            if file_looks_like_pdf(dst):
+                logger.info(f"[download] saved PDF: {os.path.basename(dst)}")
+                saved.append(dst)
+            else:
+                logger.warning(f"[download] not a PDF (skipped): {os.path.basename(dst)}")
 
         except Exception as e:
-            print(f"{fname}: parse error: {e}", file=sys.stderr, flush=True)
+            logger.warning(f"[download] failed for {url!r}: {e}")
 
-    if combined_rows:
-        out_path = os.path.join(output_dir, f"combined_{run_id}.csv")
-        write_combined_csv(out_path, combined_rows)
-        print(f"Combined CSV written: {out_path} ({len(combined_rows)} rows)", flush=True)
-        return 0
-    else:
-        print("No rows parsed across all files", file=sys.stderr, flush=True)
+    return saved
+
+
+def find_pdfs(input_dir: str) -> List[str]:
+    out: List[str] = []
+    for name in os.listdir(input_dir):
+        p = os.path.join(input_dir, name)
+        if not os.path.isfile(p):
+            continue
+        if name.lower().endswith(".pdf") or file_looks_like_pdf(p):
+            out.append(p)
+    return out
+
+
+# ---------- Debug text dumps ----------
+
+def extract_text_for_debug(pdf_path: str) -> Tuple[str, str]:
+    """
+    Returns (raw_text, trimmed_text)
+    """
+    if PdfReader is None:
+        return "", ""
+
+    try:
+        reader = PdfReader(pdf_path)
+        texts: List[str] = []
+        for page in reader.pages:
+            try:
+                texts.append(page.extract_text() or "")
+            except Exception:
+                texts.append("")
+        raw = "\n".join(texts)
+
+        # 'Trimmed' = collapse multi-space, keep printable, normalize whitespace
+        # plus keep only lines that contain alnum or punctuation (avoid empty artifacts)
+        lines = []
+        for ln in raw.splitlines():
+            ln2 = re.sub(r"[ \t]+", " ", ln).strip()
+            if ln2:
+                lines.append(ln2)
+        trimmed = "\n".join(lines)
+        return raw, trimmed
+    except Exception:
+        return "", ""
+
+
+def write_debug_texts(pdf_path: str, debug_dir: Optional[str], logger: logging.Logger) -> None:
+    if not debug_dir:
+        return
+    ensure_dir(debug_dir)
+    base = os.path.basename(pdf_path)
+    base_txt = os.path.splitext(base)[0] + ".txt"
+
+    raw, trimmed = extract_text_for_debug(pdf_path)
+    if raw:
+        with open(os.path.join(debug_dir, f"po_text_{base_txt}"), "w", encoding="utf-8") as f:
+            f.write(raw)
+    if trimmed:
+        with open(os.path.join(debug_dir, f"po_text_trimmed_{base_txt}"), "w", encoding="utf-8") as f:
+            f.write(trimmed)
+    logger.info(f"[debug] wrote text dumps for {base}")
+
+
+# ---------- Data model & CSV writer ----------
+
+HEADERS = [
+    "Order Number",
+    "Part Number",
+    "Description",
+    "Ordered",
+    "Ship-To",
+    "Delivery Date",
+    "Source File",
+    "Page",
+]
+
+
+@dataclass
+class Row:
+    order_number: str
+    part_number: str
+    description: str
+    ordered: str
+    ship_to: str
+    delivery_date: str
+    source_file: str
+    page: str
+
+    def to_list(self) -> List[str]:
+        return [
+            self.order_number,
+            self.part_number,
+            self.description,
+            self.ordered,
+            self.ship_to,
+            self.delivery_date,
+            self.source_file,
+            self.page,
+        ]
+
+
+def write_combined_csv(rows: List[Row], out_dir: str, run_id: str, logger: logging.Logger) -> str:
+    ensure_dir(out_dir)
+    out_path = os.path.join(out_dir, f"combined_{run_id}.csv")
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(HEADERS)
+        for r in rows:
+            w.writerow(r.to_list())
+    logger.info(f"[write] combined CSV: {os.path.basename(out_path)} ({len(rows)} rows)")
+    return out_path
+
+
+# ---------- Parser invocation (optional) ----------
+
+def try_import_parsers(logger: logging.Logger):
+    sp = None
+    mp = None
+    try:
+        from parsers.single_page import parse_single_page  # type: ignore
+        sp = parse_single_page
+        logger.info("[parsers] single_page loaded")
+    except Exception:
+        logger.info("[parsers] single_page not found – skipping")
+
+    try:
+        from parsers.multi_page import parse_multi_page  # type: ignore
+        mp = parse_multi_page
+        logger.info("[parsers] multi_page loaded")
+    except Exception:
+        logger.info("[parsers] multi_page not found – skipping")
+
+    return sp, mp
+
+
+# ---------- Main run ----------
+
+def run(run_id: str, input_dir: str, parsed_dir: str, output_dir: str, logs_dir: str,
+        debug_dir: Optional[str], order_number_override: Optional[str]) -> int:
+    logger, _, _ = setup_logging(logs_dir)
+    ensure_dir(input_dir)
+    ensure_dir(parsed_dir)
+    ensure_dir(output_dir)
+    if debug_dir:
+        ensure_dir(debug_dir)
+
+    # 1) Pick up list of URLs from control file (created by app.py) or environment
+    #    The serving layer posts urls and then shells us with those already placed.
+    #    For robustness, also look for urls.json if present.
+    urls_manifest = os.path.join(input_dir, "_urls.json")
+    urls: List[str] = []
+    if os.path.isfile(urls_manifest):
+        try:
+            with open(urls_manifest, "r", encoding="utf-8") as f:
+                urls = json.load(f) or []
+        except Exception:
+            urls = []
+
+    # If the app passes URLs via env var, accept those too
+    if not urls:
+        raw = os.environ.get("INPUT_URLS", "")
+        if raw:
+            try:
+                urls = json.loads(raw)
+            except Exception:
+                urls = [raw]
+
+    # 2) Download all URLs (if any); otherwise assume files already present
+    if urls:
+        logger.info(f"[intake] downloading {len(urls)} url(s)")
+        downloaded = download_all(urls, input_dir, logger)
+        if not downloaded:
+            logger.warning("[intake] no PDFs downloaded; continuing to scan input dir")
+
+    pdfs = find_pdfs(input_dir)
+    logger.info(f"[intake] found {len(pdfs)} PDF(s)")
+
+    if not pdfs:
+        logger.error("No PDFs found in input folder")
         return 3
 
+    # 3) Debug text dumps for each
+    for p in pdfs:
+        write_debug_texts(p, debug_dir, logger)
+
+    # 4) Parse (optional parsers)
+    rows: List[Row] = []
+    sp, mp = try_import_parsers(logger)
+
+    # We’ll extract order number (fallback to run_id) and pass basics to the parser(s).
+    def guess_order_number_from_name(name: str) -> str:
+        # e.g., "Purchase-Order-2025-00-34064.pdf"
+        m = re.search(r"(\d{4}-\d{2}-\d{5})|\d{2,}-\d{2,}-\d{4,}", name)
+        if m:
+            return m.group(0)
+        # Another style: 2025-00-34064
+        m2 = re.search(r"\d{4}-\d{2}-\d{5}", name)
+        return m2.group(0) if m2 else run_id
+
+    for pdf_path in pdfs:
+        fname = os.path.basename(pdf_path)
+        order_no = order_number_override or guess_order_number_from_name(fname)
+
+        # If custom parsers are available, call them; they should return a list of dict rows.
+        parsed_any = False
+        parsed_dicts: List[Dict[str, str]] = []
+
+        if sp:
+            try:
+                # expected signature: parse_single_page(pdf_path, order_number, debug_dir) -> list[dict]
+                out = sp(pdf_path, order_no, debug_dir)
+                if isinstance(out, list):
+                    parsed_dicts.extend(out)
+                    parsed_any = parsed_any or bool(out)
+                    logger.info(f"[single_page] {fname}: {len(out)} rows")
+            except Exception as e:
+                logger.warning(f"[single_page] {fname}: parser error: {e}")
+
+        if mp:
+            try:
+                # expected signature: parse_multi_page(pdf_path, order_number, debug_dir) -> list[dict]
+                out = mp(pdf_path, order_no, debug_dir)
+                if isinstance(out, list):
+                    parsed_dicts.extend(out)
+                    parsed_any = parsed_any or bool(out)
+                    logger.info(f"[multi_page]  {fname}: {len(out)} rows")
+            except Exception as e:
+                logger.warning(f"[multi_page]  {fname}: parser error: {e}")
+
+        # If neither parser added rows, we still succeed the run but with 0 rows (handled below).
+        # Normalize dicts (whatever the parser produced) into Row objects.
+        for d in parsed_dicts:
+            row = Row(
+                order_number=str(d.get("Order Number", order_no) or order_no),
+                part_number=str(d.get("Part Number", "") or ""),
+                description=str(d.get("Description", "") or ""),
+                ordered=str(d.get("Ordered", "") or ""),
+                ship_to=str(d.get("Ship-To", "") or ""),
+                delivery_date=str(d.get("Delivery Date", "") or ""),
+                source_file=str(d.get("Source File", fname) or fname),
+                page=str(d.get("Page", "1") or "1"),
+            )
+            rows.append(row)
+
+        # If your parsers are not yet wired, we at least capture debug text above.
+
+    # 5) Write combined CSV (if any rows)
+    if rows:
+        write_combined_csv(rows, output_dir, run_id, logger)
+        logger.info(f"[done] parsed {len(rows)} row(s) across {len(pdfs)} file(s)")
+        return 0
+
+    logger.error("No rows parsed across all files")
+    return 3
+
+
+def main() -> None:
+    args = parse_args()
+
+    # Robust directory creation
+    input_dir = ensure_dir(args.input)
+    parsed_dir = ensure_dir(args.parsed)
+    output_dir = ensure_dir(args.output)
+    logs_dir = ensure_dir(args.logs)
+    debug_dir = ensure_dir(args.debug) if args.debug else None
+
+    try:
+        code = run(
+            run_id=args.run_id,
+            input_dir=input_dir,
+            parsed_dir=parsed_dir,
+            output_dir=output_dir,
+            logs_dir=logs_dir,
+            debug_dir=debug_dir,
+            order_number_override=args.order_number,
+        )
+        sys.exit(code)
+    except SystemExit as e:
+        raise
+    except Exception as e:
+        # Final safety net – ensure an error is visible in stderr log
+        try:
+            with open(os.path.join(logs_dir, "agent.stderr.txt"), "a", encoding="utf-8") as f:
+                f.write(f"[fatal] {e}\n")
+        except Exception:
+            pass
+        print(f"[fatal] {e}", file=sys.stderr)
+        sys.exit(1)
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
